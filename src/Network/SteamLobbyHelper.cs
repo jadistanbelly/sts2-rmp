@@ -1,51 +1,78 @@
 using System;
-using System.Reflection;
-using HarmonyLib;
 using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Multiplayer;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Multiplayer.Transport;
+using MegaCrit.Sts2.Core.Multiplayer.Transport.Steam;
+using Steamworks;
 
 namespace RemoveMultiplayerPlayerLimit.Network;
 
-/// <summary>
-/// Steam 大厅反射工具 — 通过反射调用 Steamworks.NET API，
-/// 避免模组直接依赖 Steamworks 程序集。
-/// </summary>
 internal static class SteamLobbyHelper
 {
-	/// <summary>
-	/// 尝试更新 Steam 大厅的成员上限。
-	/// 通过反射链：NetHostGameService → SteamHost.LobbyId → SteamMatchmaking.SetLobbyMemberLimit。
-	/// 仅在 Host 端有效，失败时静默记录警告。
-	/// </summary>
-	internal static void TryUpdateMemberLimit(INetGameService netService, int limit)
+	internal static bool TryUpdateMemberLimit(INetGameService netService, int limit)
 	{
 		try
 		{
-			if (netService is not NetHostGameService hostService)
+			NetHostGameService val = (NetHostGameService)(object)((netService is NetHostGameService) ? netService : null);
+			if (val == null)
 			{
-				return;
+				return false;
 			}
-			object? netHost = hostService.NetHost;
-			if (netHost == null)
+			NetHost netHost = val.NetHost;
+			SteamHost val2 = (SteamHost)(object)((netHost is SteamHost) ? netHost : null);
+			if (val2 == null)
 			{
-				return;
+				return false;
 			}
-			// SteamHost.LobbyId → CSteamID?（Steamworks.NET 类型，通过反射避免直接依赖）
-			PropertyInfo? lobbyIdProp = AccessTools.Property(netHost.GetType(), "LobbyId");
-			object? lobbyIdObj = lobbyIdProp?.GetValue(netHost);
-			if (lobbyIdObj == null)
+			CSteamID? lobbyId = val2.LobbyId;
+			if (!lobbyId.HasValue)
 			{
-				return;
+				return false;
 			}
-			// SteamMatchmaking.SetLobbyMemberLimit(CSteamID lobbyId, int maxMembers)
-			Type? steamMatchmakingType = lobbyIdObj.GetType().Assembly.GetType("Steamworks.SteamMatchmaking");
-			MethodInfo? setLimitMethod = steamMatchmakingType?.GetMethod("SetLobbyMemberLimit");
-			setLimitMethod?.Invoke(null, new object[] { lobbyIdObj, limit });
+			bool num = SteamMatchmaking.SetLobbyMemberLimit(lobbyId.Value, limit);
+			if (num)
+			{
+				Log.Info($"[RMP] Steam lobby member limit set to {limit} (lobby={lobbyId.Value.m_SteamID})", 2);
+			}
+			else
+			{
+				Log.Warn($"[RMP] SteamMatchmaking.SetLobbyMemberLimit({limit}) returned false", 2);
+			}
+			return num;
 		}
 		catch (Exception ex)
 		{
-			Log.Warn($"Failed to update Steam lobby member limit: {ex.Message}");
+			Log.Warn("[RMP] Failed to update Steam lobby limit: " + ex.Message, 2);
+			return false;
+		}
+	}
+
+	internal static int GetCurrentMemberLimit(INetGameService netService)
+	{
+		try
+		{
+			NetHostGameService val = (NetHostGameService)(object)((netService is NetHostGameService) ? netService : null);
+			if (val == null)
+			{
+				return -1;
+			}
+			NetHost netHost = val.NetHost;
+			SteamHost val2 = (SteamHost)(object)((netHost is SteamHost) ? netHost : null);
+			if (val2 == null)
+			{
+				return -1;
+			}
+			CSteamID? lobbyId = val2.LobbyId;
+			if (!lobbyId.HasValue)
+			{
+				return -1;
+			}
+			return SteamMatchmaking.GetLobbyMemberLimit(lobbyId.Value);
+		}
+		catch
+		{
+			return -1;
 		}
 	}
 }

@@ -1,5 +1,5 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOTNET="dotnet"
@@ -13,12 +13,23 @@ else
 fi
 BUILD_ROOT="$ROOT_DIR/build"
 RELEASE_DIR="$BUILD_ROOT/RemoveMultiplayerPlayerLimit"
-DLL_SOURCE="$ROOT_DIR/.godot/mono/temp/bin/Debug/RemoveMultiplayerPlayerLimit.dll"
+DLL_SOURCE="$ROOT_DIR/.godot/mono/temp/bin/Release/RemoveMultiplayerPlayerLimit.dll"
 PCK_SOURCE="$BUILD_ROOT/RemoveMultiplayerPlayerLimit.pck"
 MANIFEST_PATH_BETA="$ROOT_DIR/RemoveMultiplayerPlayerLimit.json"
+REUSE_EXISTING_PCK="${RMP_REUSE_EXISTING_PCK:-false}"
 
-"$DOTNET" build "$ROOT_DIR/RemoveMultiplayerPlayerLimit.csproj" -c Debug
-"$GODOT" --headless --path "$ROOT_DIR" --script "res://tools/build_pck.gd"
+DOTNET_ROLL_FORWARD=Major "$DOTNET" build "$ROOT_DIR/RemoveMultiplayerPlayerLimit.csproj" -c Release
+GODOT_VERSION="$("$GODOT" --version | head -n 1)"
+if [[ "$GODOT_VERSION" == 4.5.* ]]; then
+    "$GODOT" --headless --path "$ROOT_DIR" --script "res://tools/build_pck.gd"
+elif [[ "$REUSE_EXISTING_PCK" == true && -f "$PCK_SOURCE" ]]; then
+    echo "Warning: local Godot is '$GODOT_VERSION'; reusing existing PCK at $PCK_SOURCE."
+    echo "Install Godot 4.5.x to rebuild the PCK for STS2."
+else
+    echo "Error: local Godot is '$GODOT_VERSION', but STS2 requires a 4.5-compatible PCK."
+    echo "Install Godot 4.5.x, or set RMP_REUSE_EXISTING_PCK=true to package the existing $PCK_SOURCE."
+    exit 1
+fi
 
 mkdir -p "$RELEASE_DIR"
 rm -rf "$RELEASE_DIR"/*
@@ -32,6 +43,10 @@ fi
 
 if ! command -v jq &> /dev/null; then
     echo "Error: jq is required to parse RemoveMultiplayerPlayerLimit.json. Please install it (e.g., sudo apt install jq)."
+    exit 1
+fi
+if ! command -v python3 &> /dev/null; then
+    echo "Error: python3 is required to create the release archive."
     exit 1
 fi
 VERSION=$(jq -r '.version // empty' "$MANIFEST_PATH_BETA")
@@ -56,11 +71,20 @@ rm -rf "$ZIP_STAGE_ROOT"
 mkdir -p "$ZIP_MOD_FOLDER"
 cp -r "$RELEASE_DIR"/* "$ZIP_MOD_FOLDER/"
 
-if ! command -v zip &> /dev/null; then
-    echo "Error: zip is required. Please install it."
-    exit 1
-fi
-pushd "$ZIP_STAGE_ROOT" > /dev/null
-zip -qr "../$ZIP_NAME" "$MOD_FOLDER_NAME"
-popd > /dev/null
+python3 - "$ZIP_STAGE_ROOT" "$ZIP_PATH" "$MOD_FOLDER_NAME" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+
+stage_root = Path(sys.argv[1])
+zip_path = Path(sys.argv[2])
+mod_folder = sys.argv[3]
+
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for path in sorted((stage_root / mod_folder).rglob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(stage_root))
+PY
 rm -rf "$ZIP_STAGE_ROOT"
+
+echo "Release package created: $ZIP_PATH"
