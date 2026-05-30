@@ -2,8 +2,13 @@
 .godot/
 /android/
 .tools/
+.worktrees/
+artifacts/
+bin/
 build/
 libs/
+obj/
+references/decompiled/
 
 # IDE
 .idea/

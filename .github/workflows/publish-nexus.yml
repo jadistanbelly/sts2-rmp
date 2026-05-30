@@ -1,0 +1,58 @@
+name: Publish Release to Nexus Mods
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    name: Upload release asset to Nexus Mods
+    if: ${{ !github.event.release.draft && !github.event.release.prerelease && vars.NEXUSMODS_FILE_GROUP_ID != '' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifact
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          filename="sts2-RMP-${version}.zip"
+
+          mkdir -p dist
+          gh release download "$TAG_NAME" --repo "$REPOSITORY" --pattern "$filename" --dir dist
+          test -f "dist/$filename"
+
+          {
+            echo "version=$version"
+            echo "filename=dist/$filename"
+            echo "display_name=Remove Multiplayer Player Limit $TAG_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.5
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_group_id: ${{ vars.NEXUSMODS_FILE_GROUP_ID }}
+          filename: ${{ steps.release.outputs.filename }}
+          version: ${{ steps.release.outputs.version }}
+          display_name: ${{ steps.release.outputs.display_name }}
+          description: |
+            Install:
+            1. Download this zip file.
+            2. Extract the included RemoveMultiplayerPlayerLimit folder into your Slay the Spire 2 mods directory.
+            3. Launch Slay the Spire 2 with mods enabled.
+
+            Notes:
+            - All players in a multiplayer lobby should use the same mod version.
+            - Release notes: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }}
+          file_category: main
+          archive_existing_file: true
