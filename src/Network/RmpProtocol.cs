@@ -1,91 +1,205 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using MegaCrit.Sts2.Core.Entities.Multiplayer;
 using MegaCrit.Sts2.Core.Logging;
+using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
-using MegaCrit.Sts2.Core.Multiplayer.Serialization;
+using MegaCrit.Sts2.Core.Multiplayer.Game.Lobby;
+using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Saves.Runs;
+using RemoveMultiplayerPlayerLimit.Infrastructure;
 
 namespace RemoveMultiplayerPlayerLimit.Network;
 
-/// <summary>
-/// RMP 模组独立协议层 — 与官方协议并行运行（协议并发架构）。
-///
-/// 设计原则：
-///   1. 官方协议通道：保留官方的发包逻辑，仅对核心位宽做必要扩展（SlotId/LobbyList）
-///   2. 模组协议通道：通过自定义 INetMessage / INetAction 独立发包拓展
-///   3. 两条通道并行，互不干扰
-///
-/// 自定义消息类型通过游戏的 ReflectionHelper.GetSubtypesInMods 自动注册，
-/// 自定义动作类型通过 ActionTypes 自动注册，无需手动 wire-up。
-///
-/// 此类负责：
-///   - 协议版本声明与兼容性检查
-///   - 自定义消息处理器的生命周期管理（注册/注销）
-///   - 配置同步广播
-/// </summary>
 public static class RmpProtocol
 {
-	/// <summary>协议版本号。所有对端必须一致。</summary>
 	public const int ProtocolVersion = 1;
 
 	private static INetGameService? _netService;
 
-	/// <summary>协议是否已绑定到活跃的多人会话。</summary>
 	public static bool IsActive => _netService != null;
 
-	/// <summary>
-	/// 绑定到一个多人会话的网络服务。在 StartRunLobby 创建时调用。
-	/// 自动注销之前绑定的会话（如有）。
-	/// </summary>
 	public static void Bind(INetGameService netService)
 	{
 		Unbind();
 		_netService = netService;
-		netService.RegisterMessageHandler<RmpConfigSyncMessage>(HandleConfigSync);
-		Log.Info($"RMP protocol v{ProtocolVersion} bound to {netService.Type} (NetId={netService.NetId})");
+		netService.RegisterMessageHandler<RmpConfigSyncMessage>((MessageHandlerDelegate<RmpConfigSyncMessage>)HandleConfigSync);
+		netService.RegisterMessageHandler<RmpLobbySnapshotMessage>((MessageHandlerDelegate<RmpLobbySnapshotMessage>)HandleLobbySnapshot);
+		netService.RegisterMessageHandler<RmpExtendedReadyStateMessage>((MessageHandlerDelegate<RmpExtendedReadyStateMessage>)HandleExtendedReadyState);
+		netService.RegisterMessageHandler<RmpExtendedBeginRunMessage>((MessageHandlerDelegate<RmpExtendedBeginRunMessage>)HandleExtendedBeginRun);
+		Log.Info($"[RMP] Protocol v{1} bound to {netService.Type} (NetId={netService.NetId})", 2);
 	}
 
-	/// <summary>
-	/// 解除协议绑定。在多人会话结束时调用，或在 Bind 新会话前自动调用。
-	/// </summary>
 	public static void Unbind()
 	{
-		if (_netService == null)
+		if (_netService != null)
 		{
-			return;
+			try
+			{
+				_netService.UnregisterMessageHandler<RmpConfigSyncMessage>((MessageHandlerDelegate<RmpConfigSyncMessage>)HandleConfigSync);
+				_netService.UnregisterMessageHandler<RmpLobbySnapshotMessage>((MessageHandlerDelegate<RmpLobbySnapshotMessage>)HandleLobbySnapshot);
+				_netService.UnregisterMessageHandler<RmpExtendedReadyStateMessage>((MessageHandlerDelegate<RmpExtendedReadyStateMessage>)HandleExtendedReadyState);
+				_netService.UnregisterMessageHandler<RmpExtendedBeginRunMessage>((MessageHandlerDelegate<RmpExtendedBeginRunMessage>)HandleExtendedBeginRun);
+			}
+			catch
+			{
+			}
+			_netService = null;
 		}
-		try
-		{
-			_netService.UnregisterMessageHandler<RmpConfigSyncMessage>(HandleConfigSync);
-		}
-		catch (Exception)
-		{
-			// 服务可能已 disposed，忽略清理异常
-		}
-		_netService = null;
 	}
 
-	/// <summary>
-	/// Host 向所有客户端广播当前 mod 配置。
-	/// 在玩家加入大厅、配置变更时调用。
-	/// </summary>
 	public static void BroadcastConfig(int maxPlayerLimit)
 	{
-		if (_netService == null || _netService.Type != NetGameType.Host)
+		if (_netService != null && (int)_netService.Type == 2)
 		{
-			return;
+			_netService.SendMessage<RmpConfigSyncMessage>(new RmpConfigSyncMessage
+			{
+				ProtocolVersion = 1,
+				MaxPlayerLimit = maxPlayerLimit
+			});
 		}
-		_netService.SendMessage(new RmpConfigSyncMessage
+	}
+
+	public static void BroadcastLobbySnapshot(IReadOnlyList<LobbyPlayer> players)
+	{
+		if (_netService != null && (int)_netService.Type == 2)
 		{
-			ProtocolVersion = ProtocolVersion,
-			MaxPlayerLimit = maxPlayerLimit
-		});
+			_netService.SendMessage<RmpLobbySnapshotMessage>(new RmpLobbySnapshotMessage
+			{
+				players = players.Select(RmpLobbyPlayerState.FromLobbyPlayer).ToList()
+			});
+		}
+	}
+
+	public static void BroadcastExtendedReady(bool ready)
+	{
+		if (_netService != null && (int)_netService.Type == 2)
+		{
+			_netService.SendMessage<RmpExtendedReadyStateMessage>(new RmpExtendedReadyStateMessage
+			{
+				Ready = ready
+			});
+		}
+	}
+
+	public static void BroadcastExtendedBeginRun(IReadOnlyList<LobbyPlayer> players, string seed, string act1, IReadOnlyList<ModifierModel> modifiers)
+	{
+		if (_netService != null && (int)_netService.Type == 2)
+		{
+			_netService.SendMessage<RmpExtendedBeginRunMessage>(new RmpExtendedBeginRunMessage
+			{
+				players = players.Select(RmpLobbyPlayerState.FromLobbyPlayer).ToList(),
+				seed = seed,
+				act1 = act1,
+				modifiers = modifiers.Select((ModifierModel modifier) => modifier.ToSerializable()).ToList()
+			});
+		}
 	}
 
 	private static void HandleConfigSync(RmpConfigSyncMessage message, ulong senderId)
 	{
-		if (message.ProtocolVersion != ProtocolVersion)
+		if (message.ProtocolVersion != 1)
 		{
-			Log.Warn($"RMP protocol version mismatch: local={ProtocolVersion}, remote={message.ProtocolVersion} from peer {senderId}");
+			Log.Warn($"[RMP] Protocol version mismatch: local={1}, remote={message.ProtocolVersion} from {senderId}", 2);
 		}
-		Log.Info($"RMP config sync received from {senderId}: protocol=v{message.ProtocolVersion}, maxPlayers={message.MaxPlayerLimit}");
+		Log.Info($"[RMP] Config sync from {senderId}: v{message.ProtocolVersion}, maxPlayers={message.MaxPlayerLimit} (local fixed at {16})", 2);
+	}
+
+	private static void HandleLobbySnapshot(RmpLobbySnapshotMessage message, ulong senderId)
+	{
+		if (message.players != null)
+		{
+			StartRunLobby val = SceneMonitor.FindActiveStartRunLobby();
+			if (val != null)
+			{
+				ApplyLobbySnapshot(val, message.players);
+			}
+		}
+	}
+
+	private static void HandleExtendedReadyState(RmpExtendedReadyStateMessage message, ulong senderId)
+	{
+		StartRunLobby val = SceneMonitor.FindActiveStartRunLobby();
+		if (val != null && ExtendedLobbyModule.ShouldUseExtendedLobbyProtocol(val))
+		{
+			if (ExtendedLobbyModule.TrySetPlayerReadyState(val, senderId, message.Ready, out var updatedPlayer))
+			{
+				ExtendedLobbyModule.NotifyPlayerChanged(val, updatedPlayer, isRandomCharacterResolution: false);
+			}
+			if ((int)val.NetService.Type == 2)
+			{
+				ExtendedLobbyModule.TryBeginExtendedRun(val);
+			}
+		}
+	}
+
+	private static void HandleExtendedBeginRun(RmpExtendedBeginRunMessage message, ulong senderId)
+	{
+		if (message.players == null)
+		{
+			return;
+		}
+		StartRunLobby val = SceneMonitor.FindActiveStartRunLobby();
+		if (val != null)
+		{
+			ApplyLobbySnapshot(val, message.players);
+			List<ModifierModel> list = ((IEnumerable<SerializableModifier>)message.modifiers).Select((Func<SerializableModifier, ModifierModel>)ModifierModel.FromSerializable).ToList();
+			List<ActModel> list2 = ExtendedLobbyModule.BuildActsForBeginRun(message.seed, message.act1, val, message.players.Select((RmpLobbyPlayerState player) => player.ToLobbyPlayer()).ToList());
+			val.LobbyListener.BeginRun(message.seed, list2, (IReadOnlyList<ModifierModel>)list);
+		}
+	}
+
+	private static void ApplyLobbySnapshot(StartRunLobby lobby, IReadOnlyList<RmpLobbyPlayerState> snapshotPlayers)
+	{
+		Dictionary<ulong, LobbyPlayer> dictionary = lobby.Players.ToDictionary((LobbyPlayer player) => player.id);
+		List<LobbyPlayer> list = snapshotPlayers.Select((RmpLobbyPlayerState player) => player.ToLobbyPlayer()).ToList();
+		HashSet<ulong> hashSet = list.Select((LobbyPlayer player) => player.id).ToHashSet();
+		for (int num = lobby.Players.Count - 1; num >= 0; num--)
+		{
+			LobbyPlayer val = lobby.Players[num];
+			if (!hashSet.Contains(val.id))
+			{
+				lobby.Players.RemoveAt(num);
+				if (val.id != lobby.NetService.NetId)
+				{
+					lobby.LobbyListener.RemotePlayerDisconnected(val);
+				}
+			}
+		}
+		foreach (LobbyPlayer snapshotPlayer in list)
+		{
+			if (!dictionary.TryGetValue(snapshotPlayer.id, out var value))
+			{
+				lobby.Players.Add(snapshotPlayer);
+				if (snapshotPlayer.id != lobby.NetService.NetId)
+				{
+					lobby.LobbyListener.PlayerConnected(snapshotPlayer);
+				}
+			}
+			else if (!LobbyPlayersEqual(value, snapshotPlayer))
+			{
+				int num2 = lobby.Players.FindIndex((LobbyPlayer player) => player.id == snapshotPlayer.id);
+				if (num2 >= 0)
+				{
+					lobby.Players[num2] = snapshotPlayer;
+				}
+				ExtendedLobbyModule.NotifyPlayerChanged(lobby, snapshotPlayer, isRandomCharacterResolution: false);
+			}
+		}
+		NGame instance = NGame.Instance;
+		if (instance != null)
+		{
+			instance.RemoteCursorContainer.Initialize(lobby.InputSynchronizer, lobby.Players.Select((LobbyPlayer player) => player.id));
+		}
+	}
+
+	private static bool LobbyPlayersEqual(LobbyPlayer a, LobbyPlayer b)
+	{
+		if (a.id == b.id && a.slotId == b.slotId && a.character == b.character && a.maxMultiplayerAscensionUnlocked == b.maxMultiplayerAscensionUnlocked)
+		{
+			return a.isReady == b.isReady;
+		}
+		return false;
 	}
 }
